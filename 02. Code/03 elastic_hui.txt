@@ -1,0 +1,160 @@
+library(glmnet)
+library(xlsx)
+
+options(digits=7)
+
+data_path<- 'D:\\Project_2014\\Jassen project\\02 raw data\\raw_data\\new'
+out_path<-'D:\\Project_2014\\Jassen project\\04 output hui\\Mar11'
+setwd(out_path)
+
+# readin variable list for different model
+covar_model_df <- read.table(paste(data_path, 'covar_list_all_v2.csv', sep='\\'), sep=',', head=T)  
+cohort<-'mild_uni'
+outcome<-'ga_outcome'
+if(cohort=='mild_uni' & outcome=='ga_outcome'){
+  model1_covar_list <- covar_model_df$Covar[!is.na(covar_model_df[, 2])]
+  model1_covar_list <- setdiff(model1_covar_list, c('ivi_post', 'oct_bl', 'tx_any','ivi_any','other_tx_2y'))
+}
+data_file<- paste(cohort, '_2y2_v2.csv', sep='')
+raw_data_uni <- read.table(paste(data_path, data_file, sep='\\'), sep=',', head=T)
+
+outcome<-'adv_outcome'
+if(cohort=='mild_uni' & outcome=='adv_outcome'){
+  model2_covar_list <- covar_model_df$Covar[!is.na(covar_model_df[, 3])]
+}
+
+cohort<-'mild_bil'
+outcome<-'ga_outcome'
+if(cohort=='mild_bil' & outcome=='ga_outcome'){
+  model3_covar_list <- covar_model_df$Covar[!is.na(covar_model_df[, 4])]
+}
+
+data_file<- paste(cohort, '_2y2_v2.csv', sep='')
+raw_data_bil <- read.table(paste(data_path, data_file, sep='\\'), sep=',', head=T)
+
+outcome<-'adv_outcome'
+if(cohort=='mild_bil' & outcome=='adv_outcome'){
+  model4_covar_list <- covar_model_df$Covar[!is.na(covar_model_df[, 5])]
+  model4_covar_list <- setdiff(model4_covar_list, c('ct_ivi_2y', 'other_tx_2y'))
+}
+
+cohort<-'ga_all'
+outcome<-'wet_outcome'
+if(cohort=='ga_all' & outcome=='wet_outcome'){
+  model5_covar_list <- covar_model_df$Covar[!is.na(covar_model_df[, 6])]
+  model5_covar_list <- setdiff(model5_covar_list, c('ivi_any','tx_any','ivi_post'))
+}
+
+data_file<- paste(cohort, '_2y2_v2.csv', sep='')
+raw_data_ga <- read.table(paste(data_path, data_file, sep='\\'), sep=',', head=T)
+
+model1_covar_list<-as.vector(model1_covar_list)
+model2_covar_list<-as.vector(model2_covar_list)
+model3_covar_list<-as.vector(model3_covar_list)
+model4_covar_list<-as.vector(model4_covar_list)
+model5_covar_list<-as.vector(model5_covar_list)
+
+ cohort<-'ga_all'
+ outcome<-'wet_outcome'
+ model_type<-'model5'
+ kfold<-5
+
+elastic<-function(cohort,outcome,model_type,kfold){
+
+  data_file<- paste(cohort, '_2y2_v2.csv', sep='')
+  raw_data <- read.table(paste(data_path, data_file, sep='\\'), sep=',', head=T)
+  names(raw_data)<-tolower(names(raw_data))
+  eval(parse(text = paste("model_data<-raw_data[,c('" , outcome ,"',",model_type,'_covar_list)]', sep='')))
+  eval(parse(text = paste("model_data$response<-model_data[,'",outcome,"']",sep='')))
+  training_data_lasso<-model_data[,-1]
+  
+  
+  k.folds<- kfold                                                           # tenfold cross-validation
+  foldid<- nrow(training_data_lasso)
+  foldid[training_data_lasso$response==1]<-sample(rep(1:k.folds, length=length(which(training_data_lasso$response==1))))
+  foldid[training_data_lasso$response==0]<- sample(rep(1:k.folds, length=length(which(training_data_lasso$response==0))))
+  table(training_data_lasso$response , foldid) # QC
+    
+  training_matrix<- model.matrix(response~., data=training_data_lasso)[,-1]# removes intercept term
+  elastic_results<- numeric()
+
+  for(alpha in seq(0, 1, 0.01)){
+    # Calculating initial lambda and the lambda sequence
+    initial_lambda<-glmnet(x=training_matrix, y=training_data_lasso$response, family="binomial", 
+                           alpha=alpha, standardize=F)$lambda  # calculating the initial lambda
+    
+    lambda_seq<- c(initial_lambda[-length(initial_lambda)] , 
+                   seq(initial_lambda[length(initial_lambda)] ,  0 , length=500)) # get a length=500 descending sequence from initial lambda to 0
+    
+    cv_auc <- matrix(nr=k.folds , nc=length(lambda_seq))
+    
+    # Tenfold cross-validation
+      for(i in 1:k.folds){
+        cv_training_data_lasso<- training_data_lasso[foldid!=i,]                                            # select 9 folds as training data
+        cv_training_matrix<- model.matrix(response~., data=cv_training_data_lasso)[,-1]
+        cv_test_data_lasso<- training_data_lasso[foldid==i,]                                                # select 1 fold as test data
+        cv_test_matrix<- model.matrix(response~., data=cv_test_data_lasso)[,-1]
+        
+        fit_lasso<- glmnet(cv_training_matrix, cv_training_data_lasso$response, 
+                           lambda=lambda_seq, family="binomial", alpha=alpha, standardize=F,maxit=1000000)
+        
+        test_pred<- predict(fit_lasso, cv_test_matrix, type="response")
+        test_pred_avg<- apply(test_pred, 2, function(x){auc(cv_test_data_lasso$response , x)})
+        test_pred_avg<- c(test_pred_avg , rep(NA , length(lambda_seq) - length(test_pred_avg))) # some small lambda may not be reached
+        
+        cv_auc[i,]<- test_pred_avg                                                              # calculate the AUC based on left-out fold
+      }    
+    cv_auc_mean<- apply(cv_auc , 2 , function(x) mean(x[!is.na(x)]))
+    total_model<- glmnet(x=training_matrix, y=training_data_lasso$response, lambda=lambda_seq, 
+                         family="binomial", alpha=alpha, standardize=F)
+    
+    optimum_model<- which.max(cv_auc_mean)
+    
+    optimum_lambda <- lambda_seq[optimum_model]
+    model_coef<- total_model$beta[,optimum_model]
+    training_obs<- predict(total_model, training_matrix, type="response")[,optimum_model]
+    training_auc<- auc(training_data_lasso$response , training_obs)
+    test_auc <- max(cv_auc_mean)
+    
+    model_coef1<- model_coef[model_coef!=0]
+    odds_ratio<- exp(model_coef)[model_coef != 0]
+    non_zero_var<- names(model_coef)[model_coef != 0]
+    re_model_var<- c('response', non_zero_var)
+    re_fit<- glm(response~., data=training_data_lasso[,match(re_model_var , names(training_data_lasso))], family=binomial)
+    p_value<- summary(re_fit)$coef[, "Pr(>|z|)"][-1]
+    if(length(p_value)!=length(odds_ratio)){
+      p_value <- p_value[match(names(odds_ratio), names(p_value))]
+    }
+   
+    
+    temp <- data.frame(non_zero_var,model_coef1,odds_ratio, p_value,alpha,optimum_lambda, training_auc,test_auc)
+    
+    elastic_results <- rbind(elastic_results, temp)
+    
+    }
+
+  max_auc <- max(elastic_results$test_auc)
+
+  model_result <- elastic_results[elastic_results$test_auc==max_auc,]
+  
+  eval(parse(text = paste("write.xlsx(model_result,'",cohort, "_auc_v3.xlsx',sheetName='",outcome, "',append=T)"  , sep='')))
+  
+}
+
+elastic('mild_uni', 'ga_outcome', 'model1', 5)
+elastic('mild_uni', 'adv_outcome', 'model2', 10)
+elastic('mild_bil', 'ga_outcome', 'model3', 5)
+elastic('mild_bil', 'adv_outcome', 'model4', 10)
+elastic('ga_all', 'wet_outcome', 'model5', 5)
+
+
+
+
+
+
+
+
+
+
+
+
